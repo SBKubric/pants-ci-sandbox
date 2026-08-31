@@ -17,4 +17,5 @@ def count_items() -> int:
 
 def has_items() -> bool:
     """Есть ли сущности в тестовом наборе сервиса beta."""
+    # Тривиальная правка для проверки commitlint (K14).
     return count_items() > 0
