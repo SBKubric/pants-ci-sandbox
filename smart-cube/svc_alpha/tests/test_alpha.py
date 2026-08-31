@@ -1,6 +1,6 @@
 """Юнит-тесты для svc_alpha.alpha."""
 
-from svc_alpha.alpha import count_items, describe
+from svc_alpha.alpha import count_items, describe, has_items
 
 
 def test_describe() -> None:
@@ -11,3 +11,8 @@ def test_describe() -> None:
 def test_count_items() -> None:
     """Количество сущностей в тестовом наборе равно двум."""
     assert count_items() == 2
+
+
+def test_has_items() -> None:
+    """В тестовом наборе есть сущности."""
+    assert has_items() is True

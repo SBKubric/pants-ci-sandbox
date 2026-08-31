@@ -13,3 +13,8 @@ def count_items() -> int:
     """Вернуть количество сущностей в тестовом наборе сервиса alpha."""
     items = [Item(name="alpha-1", weight=1.0), Item(name="alpha-2", weight=2.0)]
     return len(items)
+
+
+def has_items() -> bool:
+    """Есть ли сущности в тестовом наборе сервиса alpha."""
+    return count_items() > 0
