@@ -1,3 +1,4 @@
+# K11: безвредный комментарий — проверка full=true при правке pants.toml.
 [GLOBAL]
 pants_version = "2.30.0"
 backend_packages = [
