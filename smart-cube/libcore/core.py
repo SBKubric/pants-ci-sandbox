@@ -28,3 +28,10 @@ def max_weight(items: list[Item]) -> float:
     if not items:
         return 0.0
     return max(item.weight for item in items)
+
+
+def min_weight(items: list[Item]) -> float:
+    """Найти минимальный вес сущности в списке (0.0 для пустого списка)."""
+    if not items:
+        return 0.0
+    return min(item.weight for item in items)
