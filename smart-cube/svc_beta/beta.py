@@ -18,3 +18,8 @@ def count_items() -> int:
 def has_items() -> bool:
     """Есть ли сущности в тестовом наборе сервиса beta."""
     return count_items() > 0
+
+
+def is_empty() -> bool:
+    """Пуст ли тестовый набор сервиса beta."""
+    return not has_items()
