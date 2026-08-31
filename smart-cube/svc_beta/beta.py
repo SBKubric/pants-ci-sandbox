@@ -17,4 +17,5 @@ def count_items() -> int:
 
 def has_items() -> bool:
     """Есть ли сущности в тестовом наборе сервиса beta."""
+    # Мелкая непринципиальная правка мимо стека — ветка misc-direct-tweak.
     return count_items() > 0
