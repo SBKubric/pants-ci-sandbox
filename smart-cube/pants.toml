@@ -1,0 +1,19 @@
+[GLOBAL]
+pants_version = "2.30.0"
+backend_packages = [
+  "pants.backend.python",
+  "pants.backend.experimental.python.lint.ruff.check",
+]
+
+[python]
+interpreter_constraints = ["==3.13.*"]
+enable_resolves = true
+
+[python.resolves]
+python-default = "python-default.lock"
+
+[source]
+root_patterns = ["/"]
+
+[test]
+extra_env_vars = ["DOCKER_HOST", "TESTCONTAINERS_RYUK_DISABLED"]

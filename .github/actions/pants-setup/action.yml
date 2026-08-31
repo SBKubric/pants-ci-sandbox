@@ -1,0 +1,79 @@
+name: Pants setup
+description: >
+  Общая подготовка окружения для pants-job'ов CI: Python, кэш Pants,
+  бутстрап pants и вычисление базы для --changed-since. Используется job'ами
+  pants и pants-heavy из ci.yml — до вынесения сюда оба дублировали одни
+  и те же ~50 строк.
+
+inputs:
+  python-version:
+    description: Версия Python для actions/setup-python.
+    required: true
+  base-ref:
+    description: >
+      Базовая ветка PR (github.base_ref). Пустая строка — полный прогон
+      (push/workflow_dispatch, у них base_ref не задан).
+    required: false
+    default: ""
+  full:
+    description: >
+      "true" — игнорировать дифф-выборку и гонять весь репозиторий (::),
+      даже если base-ref задан. Прокидывается из needs.decide.outputs.full.
+    required: false
+    default: "false"
+
+outputs:
+  base-ref:
+    description: >
+      origin/<base-ref> для --changed-since, либо пустая строка. Пустая
+      строка означает «полный прогон» и покрывает сразу push/dispatch/full —
+      вызывающий job проверяет только -n/-z, не разбирая причину.
+    value: ${{ steps.base.outputs.ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Cache Pants setup
+      uses: actions/cache@v4
+      with:
+        # ~/.cache/pants/setup здесь нет: scie-pants складывает лаунчер и
+        # CPython в ~/.cache/nce, а setup — легаси-путь и остаётся пустым.
+        path: |
+          ~/.cache/nce
+          ~/.cache/pants/named_caches
+          ~/.cache/pants/lmdb_store
+        key: ${{ runner.os }}-pants-${{ hashFiles('smart-cube/pants.toml', 'smart-cube/python-default.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-pants-
+
+    - name: Bootstrap Pants
+      shell: bash
+      run: |
+        curl --proto '=https' --tlsv1.2 -fsSLo get-pants.sh https://raw.githubusercontent.com/pantsbuild/setup/6f136713a46e555946a22ffb3ed49c372eea58df/get-pants.sh
+        chmod +x get-pants.sh
+        ./get-pants.sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    # База для --changed-since. Пустой ref = «полный прогон»: так для
+    # push/dispatch (base-ref не задан вызывающим job'ом) и при full=true
+    # (PR меняет pants.toml/лок/workflow-файлы — см. job decide в ci.yml).
+    # Без интерполяции ${{ }} внутри run — только через env, ref из PR может
+    # прийти из недоверенного контекста (форк).
+    - name: Resolve diff base
+      id: base
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        FULL: ${{ inputs.full }}
+      run: |
+        if [ "$FULL" = "true" ] || [ -z "$BASE_REF" ]; then
+          echo "ref=" >> "$GITHUB_OUTPUT"
+        else
+          git fetch --no-tags origin "$BASE_REF"
+          echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+        fi

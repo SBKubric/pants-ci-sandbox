@@ -1,0 +1,223 @@
+name: CI
+
+# pull_request — проверки по диффу PR.
+# push в main — полный unit-прогон: валидирует main после слияния и прогревает
+# кэш Pants в скоупе ветки по умолчанию (его читают все PR — кэши PR-ранов
+# живут в своём скоупе refs/pull/N/merge и между PR не шарятся).
+# workflow_dispatch — страховочный полный прогон всего репозитория, включая heavy.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Новый пуш в PR отменяет предыдущий незавершённый прогон.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Решает, каким режимом гонять остальные job'ы:
+  #   heavy — нужны ли тесты с тегом heavy (testcontainers, живые сервисы);
+  #   full  — доверять ли дифф-выборке вообще, или гонять весь репозиторий (::).
+  # full=true всегда тянет за собой heavy=true.
+  #
+  # Heavy гоняются, только когда стек вливается в main: PR в main из ветки,
+  # которая НЕ является участником стека (^[0-9]+-pr[0-9]+(-|$), например
+  # 434-pr15 или 434-pr15-taskplanner-ops). Для stacked PR (база — stack/NNN
+  # или соседний prK) heavy пропускаются. На push в main heavy тоже не гоняются:
+  # там задача — прогреть кэш и провалидировать unit целиком, а не heavy.
+  decide:
+    name: Scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.check.outputs.heavy }}
+      full: ${{ steps.check.outputs.full }}
+    steps:
+      - name: Decide heavy scope
+        id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR: ${{ github.event.pull_request.number }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          full=false
+          heavy=false
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            full=true
+            heavy=true
+          elif [ "$EVENT" = "pull_request" ]; then
+            # Изменения pants.toml / лок-файла / workflow-файлов не принадлежат
+            # ни одному pants-таргету — дифф-выборка дала бы пустоту и зелёный
+            # CI без единой проверки, поэтому такие PR гоняем целиком.
+            files="$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')"
+            if printf '%s\n' "$files" | grep -qE '^(smart-cube/pants\.toml$|smart-cube/python-default\.lock$|\.github/(workflows|actions)/)'; then
+              full=true
+              heavy=true
+            fi
+
+            if [ "$SAME_REPO" != "true" ]; then
+              # Голова PR из форка — имени ветки (head_ref) не доверяем, его
+              # выбирает автор форка, а не мы. Гоняем heavy на всякий случай.
+              heavy=true
+            elif [ "$BASE_REF" = "main" ] && ! printf '%s' "$HEAD_REF" | grep -qE '^[0-9]+-pr[0-9]+(-|$)'; then
+              heavy=true
+            fi
+          fi
+          # push (в main): оба флага остаются false — полный unit-прогон
+          # обеспечивает уже пустая база (см. job pants и pants-setup).
+
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_REF head=$HEAD_REF heavy=$heavy full=$full"
+
+  commitlint:
+    runs-on: ubuntu-latest
+    # На push/dispatch в payload события нет диапазона коммитов PR — линтить нечего.
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Lint commits
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.cjs
+
+  # Линтеры + юнит-тесты. Гоняются на КАЖДОМ PR и на push в main, по диффу:
+  # pants сам выбирает таргеты, которых касается изменение (транзитивно).
+  # Пустой base-ref от pants-setup (push/dispatch/full=true) переключает шаги
+  # на полный прогон ::.
+  pants:
+    name: Lint + unit tests
+    needs: decide
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: smart-cube
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Pants setup
+        id: pants-setup
+        uses: ./.github/actions/pants-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+          base-ref: ${{ github.base_ref }}
+          full: ${{ needs.decide.outputs.full }}
+
+      - name: Check BUILD files
+        run: |
+          pants update-build-files --check ::
+
+      - name: Lint
+        run: |
+          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
+            pants --changed-since=${{ steps.pants-setup.outputs.base-ref }} lint
+          else
+            pants lint ::
+          fi
+
+      - name: Test (unit)
+        run: |
+          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
+            pants --tag=-heavy \
+              --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
+              --changed-dependents=transitive \
+              test
+          else
+            pants --tag=-heavy test ::
+          fi
+
+      - name: Package
+        run: |
+          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
+            pants --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
+              --changed-dependents=transitive \
+              --filter-target-type=pex_binary,python_distribution \
+              package
+          else
+            pants package ::
+          fi
+
+      - name: Upload Pants log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pants-log-unit
+          path: smart-cube/.pants.d/workdir/pants.log
+
+  # Heavy тесты (testcontainers: PostgreSQL/Redis/RabbitMQ, живые gRPC/HTTP серверы).
+  # Гоняются на финальном PR стека в main (слияние стека), на workflow_dispatch
+  # и при full=true (PR меняет pants.toml/лок/workflow-файлы — дифф-выборка
+  # это не поймает). НЕ гоняются на push в main (там нужен только прогрев кэша
+  # и unit-валидация, см. job decide) и на stacked PR: ветки вида NNN-prK,
+  # временно нацеленные на main, переводит на stack/NNN workflow stack-branch.yml.
+  pants-heavy:
+    name: Heavy tests
+    needs: decide
+    if: needs.decide.outputs.heavy == 'true'
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: smart-cube
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Pants setup
+        id: pants-setup
+        uses: ./.github/actions/pants-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+          base-ref: ${{ github.base_ref }}
+          full: ${{ needs.decide.outputs.full }}
+
+      # Ryuk (контейнер-уборщик testcontainers) на GitHub-раннерах не нужен:
+      # раннер одноразовый, а сам Ryuk стоит лишнего времени старта.
+      - name: Test (heavy)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: |
+          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
+            pants --tag=heavy \
+              --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
+              --changed-dependents=transitive \
+              test
+          else
+            pants --tag=heavy test ::
+          fi
+
+      - name: Upload Pants log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pants-log-heavy
+          path: smart-cube/.pants.d/workdir/pants.log
