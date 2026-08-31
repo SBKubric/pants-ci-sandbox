@@ -21,3 +21,10 @@ def average_weight(items: list[Item]) -> float:
     if not items:
         return 0.0
     return total_weight(items) / len(items)
+
+
+def max_weight(items: list[Item]) -> float:
+    """Найти максимальный вес сущности в списке (0.0 для пустого списка)."""
+    if not items:
+        return 0.0
+    return max(item.weight for item in items)
