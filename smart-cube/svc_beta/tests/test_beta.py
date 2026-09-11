@@ -1,6 +1,6 @@
 """Юнит-тесты для svc_beta.beta."""
 
-from svc_beta.beta import count_items, has_items, summarize
+from svc_beta.beta import count_items, has_items, summarize, lightest_weight
 
 
 def test_summarize() -> None:
@@ -16,3 +16,8 @@ def test_count_items() -> None:
 def test_has_items() -> None:
     """В тестовом наборе есть сущности."""
     assert has_items() is True
+
+
+def test_lightest_weight() -> None:
+    """Самая лёгкая сущность набора beta весит 0.25."""
+    assert lightest_weight() == 0.25
