@@ -20,6 +20,12 @@ name: Stack auto PR
 # ready_for_review в ci.yml). Это ровно тот момент, когда стек готов к
 # слиянию, ради которого heavy и разводились с unit.
 #
+# ПРЕДУСЛОВИЕ. Создавать PR под GITHUB_TOKEN GitHub по умолчанию запрещает,
+# и одних permissions ниже мало: нужна галка «Allow GitHub Actions to create
+# and approve pull requests» (Settings → Actions → General → Workflow
+# permissions, репозитория или организации). Без неё шаг падает с внятной
+# ошибкой — см. его последний блок.
+#
 # Пару этому workflow составляет stack-branch.yml: он создаёт саму ветку
 # stack/NNN и переводит на неё базу PR шага.
 
@@ -108,9 +114,18 @@ jobs:
 
           # --head здесь обязателен: он же отключает попытки gh запушить ветку
           # или форкнуть репозиторий, которых в CI без чекаута быть не может.
-          pr_url="$(gh pr create --repo "$REPO" \
+          if ! pr_url="$(gh pr create --repo "$REPO" \
             --base main --head "$STACK_BRANCH" --draft \
-            --title "$title" --body-file /tmp/stack-pr-body.md)"
+            --title "$title" --body-file /tmp/stack-pr-body.md 2>/tmp/stack-pr-err.txt)"; then
+            cat /tmp/stack-pr-err.txt >&2
+            if grep -q 'not permitted to create or approve pull requests' /tmp/stack-pr-err.txt; then
+              echo "::error::Actions запрещено создавать PR. Включить: Settings → Actions →" \
+                   "General → Workflow permissions → «Allow GitHub Actions to create and" \
+                   "approve pull requests» (галка есть и у репозитория, и у организации —" \
+                   "организационная перекрывает). Пока её нет, PR стека открывается руками."
+            fi
+            exit 1
+          fi
           echo "Открыт черновик PR стека: $pr_url"
 
           {
