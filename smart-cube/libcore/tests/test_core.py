@@ -1,6 +1,6 @@
 """Юнит-тесты для libcore.core."""
 
-from libcore.core import Item, average_weight, max_weight, total_weight
+from libcore.core import Item, average_weight, max_weight, min_weight, total_weight
 
 
 def test_total_weight() -> None:
@@ -34,3 +34,13 @@ def test_max_weight() -> None:
 def test_max_weight_empty() -> None:
     """Пустой список даёт нулевой максимальный вес."""
     assert max_weight([]) == 0.0
+
+
+def test_min_weight() -> None:
+    """Минимальный вес — вес самой лёгкой сущности."""
+    assert min_weight([Item(name="a", weight=3.0), Item(name="b", weight=1.5)]) == 1.5
+
+
+def test_min_weight_empty() -> None:
+    """Минимальный вес пустого списка — 0.0."""
+    assert min_weight([]) == 0.0
