@@ -1,6 +1,6 @@
 """Сервис alpha: пример использования общей библиотеки libcore."""
 
-from libcore.core import Item, total_weight
+from libcore.core import Item, heaviest, total_weight
 
 
 def describe() -> str:
@@ -18,3 +18,10 @@ def count_items() -> int:
 def has_items() -> bool:
     """Есть ли сущности в тестовом наборе сервиса alpha."""
     return count_items() > 0
+
+
+def heaviest_name() -> str:
+    """Имя самой тяжёлой сущности тестового набора сервиса alpha."""
+    items = [Item(name="alpha-1", weight=1.0), Item(name="alpha-2", weight=2.0)]
+    top = heaviest(items)
+    return top.name if top else ""
