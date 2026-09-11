@@ -35,3 +35,10 @@ def min_weight(items: list[Item]) -> float:
     if not items:
         return 0.0
     return min(item.weight for item in items)
+
+
+def heaviest(items: list[Item]) -> Item | None:
+    """Вернуть самую тяжёлую сущность списка (None для пустого списка)."""
+    if not items:
+        return None
+    return max(items, key=lambda item: item.weight)
