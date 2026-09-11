@@ -1,6 +1,6 @@
 """Сервис beta: пример использования общей библиотеки libcore."""
 
-from libcore.core import Item, total_weight
+from libcore.core import Item, min_weight, total_weight
 
 
 def summarize() -> str:
@@ -18,3 +18,8 @@ def count_items() -> int:
 def has_items() -> bool:
     """Есть ли сущности в тестовом наборе сервиса beta."""
     return count_items() > 0
+
+
+def lightest_weight() -> float:
+    """Вес самой лёгкой сущности в тестовом наборе сервиса beta."""
+    return min_weight([Item(name="beta-1", weight=0.5), Item(name="beta-2", weight=0.25)])
