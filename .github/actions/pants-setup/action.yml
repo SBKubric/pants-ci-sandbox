@@ -2,8 +2,8 @@ name: Pants setup
 description: >
   Общая подготовка окружения для pants-job'ов CI: Python, кэш Pants,
   бутстрап pants и вычисление базы для --changed-since. Используется job'ами
-  pants и pants-heavy из ci.yml — до вынесения сюда оба дублировали одни
-  и те же ~50 строк.
+  build, pants и pants-heavy из ci.yml — до вынесения сюда они дублировали
+  одни и те же ~50 строк.
 
 inputs:
   python-version:
@@ -19,6 +19,14 @@ inputs:
     description: >
       "true" — игнорировать дифф-выборку и гонять весь репозиторий (::),
       даже если base-ref задан. Прокидывается из needs.decide.outputs.full.
+    required: false
+    default: "false"
+  save-cache:
+    description: >
+      "true" — job пишет кэш Pants по итогам своей работы; иначе только
+      читает. Писатель в прогоне ровно один — job build, он идёт первым и
+      греет кэш остальным (см. ci.yml). Два писателя ничего не ломают, но
+      второй выгружает те же ~1,4 ГБ впустую и отлетает дублем ключа.
     required: false
     default: "false"
 
@@ -38,11 +46,28 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
-    - name: Cache Pants setup
+    # Две ветки одного кэша: полный actions/cache сохраняет его в post-шаге
+    # job'а (то есть ПОСЛЕ работы pants — ради этого он и нужен писателю),
+    # actions/cache/restore только поднимает. Путь и ключ приходится держать
+    # в обеих: подстановок вроде YAML-якорей в composite action нет.
+    # ~/.cache/pants/setup ни там, ни там: scie-pants складывает лаунчер и
+    # CPython в ~/.cache/nce, а setup — легаси-путь и остаётся пустым.
+    - name: Cache Pants setup (чтение и запись)
+      if: inputs.save-cache == 'true'
       uses: actions/cache@v4
       with:
-        # ~/.cache/pants/setup здесь нет: scie-pants складывает лаунчер и
-        # CPython в ~/.cache/nce, а setup — легаси-путь и остаётся пустым.
+        path: |
+          ~/.cache/nce
+          ~/.cache/pants/named_caches
+          ~/.cache/pants/lmdb_store
+        key: ${{ runner.os }}-pants-${{ hashFiles('smart-cube/pants.toml', 'smart-cube/python-default.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-pants-
+
+    - name: Cache Pants setup (только чтение)
+      if: inputs.save-cache != 'true'
+      uses: actions/cache/restore@v4
+      with:
         path: |
           ~/.cache/nce
           ~/.cache/pants/named_caches
@@ -54,7 +79,7 @@ runs:
     - name: Bootstrap Pants
       shell: bash
       run: |
-        curl --proto '=https' --tlsv1.2 -fsSLo get-pants.sh https://raw.githubusercontent.com/pantsbuild/setup/6f136713a46e555946a22ffb3ed49c372eea58df/get-pants.sh
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 -fsSLo get-pants.sh https://raw.githubusercontent.com/pantsbuild/setup/6f136713a46e555946a22ffb3ed49c372eea58df/get-pants.sh
         chmod +x get-pants.sh
         ./get-pants.sh
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"

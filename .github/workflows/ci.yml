@@ -5,8 +5,17 @@ name: CI
 # кэш Pants в скоупе ветки по умолчанию (его читают все PR — кэши PR-ранов
 # живут в своём скоупе refs/pull/N/merge и между PR не шарятся).
 # workflow_dispatch — страховочный полный прогон всего репозитория, включая heavy.
+# ready_for_review — снятие черновика. В списке типов его нет по умолчанию, а
+# нужен он потому, что на черновиках heavy выключены (job decide): у авто-PR
+# стека (stack-auto-pr.yml) именно это событие и есть «стек собран, гоняем всё».
+# Остальные три типа — умолчание GitHub, перечислены явно, раз список задан.
+#
+# Порядок job'ов: decide → build → (pants | pants-heavy). Сборка артефактов
+# вынесена отдельным шагом перед пайплайном намеренно — см. комментарий к
+# job'у build.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -31,6 +40,7 @@ jobs:
   # 434-pr15 или 434-pr15-taskplanner-ops). Для stacked PR (база — stack/NNN
   # или соседний prK) heavy пропускаются. На push в main heavy тоже не гоняются:
   # там задача — прогреть кэш и провалидировать unit целиком, а не heavy.
+  # Черновик не гоняет heavy вообще: работа ещё не предъявлена к слиянию.
   decide:
     name: Scope
     runs-on: ubuntu-latest
@@ -47,6 +57,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           PR: ${{ github.event.pull_request.number }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          DRAFT: ${{ github.event.pull_request.draft }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -73,13 +84,23 @@ jobs:
             elif [ "$BASE_REF" = "main" ] && ! printf '%s' "$HEAD_REF" | grep -qE '^[0-9]+-pr[0-9]+(-|$)'; then
               heavy=true
             fi
+
+            # Черновик — последнее слово, и оно гасит heavy даже в full-режиме:
+            # full означает «дифф-выборке не доверяем» (unit гоняем целиком), а
+            # не «работа готова». Авто-PR стека живёт черновиком, пока стек
+            # собирается: иначе heavy гонялись бы на каждом слиянии шага, хотя
+            # разведение лейнов затевалось ради одного прогона на весь стек.
+            # Снятие черновика (ready_for_review) вернёт heavy=true.
+            if [ "$DRAFT" = "true" ]; then
+              heavy=false
+            fi
           fi
           # push (в main): оба флага остаются false — полный unit-прогон
           # обеспечивает уже пустая база (см. job pants и pants-setup).
 
           echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE_REF head=$HEAD_REF heavy=$heavy full=$full"
+          echo "base=$BASE_REF head=$HEAD_REF draft=$DRAFT heavy=$heavy full=$full"
 
   commitlint:
     runs-on: ubuntu-latest
@@ -96,21 +117,27 @@ jobs:
         with:
           configFile: commitlint.config.cjs
 
-  # Линтеры + юнит-тесты. Гоняются на КАЖДОМ PR и на push в main, по диффу:
-  # pants сам выбирает таргеты, которых касается изменение (транзитивно).
-  # Пустой base-ref от pants-setup (push/dispatch/full=true) переключает шаги
-  # на полный прогон ::.
-  pants:
-    name: Lint + unit tests
+  # Сборка артефактов pants — единственный «холодный» job прогона: он первым
+  # бутстрапит pants, резолвит лок, гоняет кодоген и упаковку, и только он
+  # пишет кэш. Lint/unit и heavy идут после него и поднимают этот кэш уже
+  # тёплым. До вынесения этого шага оба они делали одну и ту же подготовку
+  # параллельно, каждый платил за неё полностью и каждый выгружал свою копию
+  # кэша (~1,4 ГБ) — вторая выгрузка отлетала как дубль ключа.
+  # Заодно fail-fast: битый BUILD-файл или несобираемый pex виден до тестов,
+  # а не через десять минут после них.
+  build:
+    name: Build artifacts
     needs: decide
-    timeout-minutes: 45
+    # 20 мин: на холодном кэше сюда попадает весь бутстрап и полный `package ::`
+    # в full-режиме. Раньше это время пряталось внутри job'а с тестами.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: smart-cube
     strategy:
       matrix:
-        python-version: ["3.13"]
+        python-version: ['3.13']
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -125,10 +152,60 @@ jobs:
           python-version: ${{ matrix.python-version }}
           base-ref: ${{ github.base_ref }}
           full: ${{ needs.decide.outputs.full }}
+          # Единственный писатель кэша в прогоне (см. комментарий к job'у).
+          save-cache: 'true'
 
       - name: Check BUILD files
         run: |
           pants update-build-files --check ::
+
+      - name: Package
+        run: |
+          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
+            pants --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
+              --changed-dependents=transitive \
+              --filter-target-type=pex_binary,python_distribution \
+              package
+          else
+            pants package ::
+          fi
+
+      - name: Upload Pants log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pants-log-build
+          path: smart-cube/.pants.d/workdir/pants.log
+
+  # Линтеры + юнит-тесты. Гоняются на КАЖДОМ PR и на push в main, по диффу:
+  # pants сам выбирает таргеты, которых касается изменение (транзитивно).
+  # Пустой base-ref от pants-setup (push/dispatch/full=true) переключает шаги
+  # на полный прогон ::. Кэш только читает — его подготовил job build.
+  pants:
+    name: Lint + unit tests
+    needs: [decide, build]
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: smart-cube
+    strategy:
+      matrix:
+        python-version: ['3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Pants setup
+        id: pants-setup
+        uses: ./.github/actions/pants-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+          base-ref: ${{ github.base_ref }}
+          full: ${{ needs.decide.outputs.full }}
 
       - name: Lint
         run: |
@@ -149,17 +226,6 @@ jobs:
             pants --tag=-heavy test ::
           fi
 
-      - name: Package
-        run: |
-          if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
-            pants --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
-              --changed-dependents=transitive \
-              --filter-target-type=pex_binary,python_distribution \
-              package
-          else
-            pants package ::
-          fi
-
       - name: Upload Pants log
         if: always()
         uses: actions/upload-artifact@v4
@@ -171,20 +237,21 @@ jobs:
   # Гоняются на финальном PR стека в main (слияние стека), на workflow_dispatch
   # и при full=true (PR меняет pants.toml/лок/workflow-файлы — дифф-выборка
   # это не поймает). НЕ гоняются на push в main (там нужен только прогрев кэша
-  # и unit-валидация, см. job decide) и на stacked PR: ветки вида NNN-prK,
-  # временно нацеленные на main, переводит на stack/NNN workflow stack-branch.yml.
+  # и unit-валидация, см. job decide), на черновиках (стек ещё собирается) и на
+  # stacked PR: ветки вида NNN-prK, временно нацеленные на main, переводит на
+  # stack/NNN workflow stack-branch.yml.
   pants-heavy:
     name: Heavy tests
-    needs: decide
+    needs: [decide, build]
     if: needs.decide.outputs.heavy == 'true'
-    timeout-minutes: 90
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: smart-cube
     strategy:
       matrix:
-        python-version: ["3.13"]
+        python-version: ['3.13']
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -202,17 +269,28 @@ jobs:
 
       # Ryuk (контейнер-уборщик testcontainers) на GitHub-раннерах не нужен:
       # раннер одноразовый, а сам Ryuk стоит лишнего времени старта.
+      # Heavy — это контейнеры и живые серверы на фиксированных портах (22334,
+      # 8001/8002, 50051/50052): параллельно они толкают друг друга за порт, и
+      # прогон краснеет не по вине кода. Unit-лейн (шаг выше) остаётся
+      # параллельным — там биндов портов нет.
+      #
+      # parallelism=1 — именно поэтому: batch_compatibility_tag собирает файлы
+      # пакета в один pytest-процесс, но САМИ батчи pants пускает параллельно
+      # (число батчей зависит от хэша адреса таргета, а не от их количества —
+      # pants/util/collections.py), и два процесса делят порт через SO_REUSEPORT:
+      # запрос уходит в чужой сервис, тест читает свой пустой Redis. Это затычка,
+      # цена — heavy идёт по очереди; решение — свои порты на процесс.
       - name: Test (heavy)
         env:
-          TESTCONTAINERS_RYUK_DISABLED: "true"
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
         run: |
           if [ -n "${{ steps.pants-setup.outputs.base-ref }}" ]; then
-            pants --tag=heavy \
+            pants --tag=heavy --process-execution-local-parallelism=1 \
               --changed-since=${{ steps.pants-setup.outputs.base-ref }} \
               --changed-dependents=transitive \
               test
           else
-            pants --tag=heavy test ::
+            pants --tag=heavy --process-execution-local-parallelism=1 test ::
           fi
 
       - name: Upload Pants log

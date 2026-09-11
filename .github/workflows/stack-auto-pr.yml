@@ -1,0 +1,123 @@
+name: Stack auto PR
+
+# Авто-PR интеграционной ветки стека в main.
+#
+# Соглашение (CLAUDE.md, «Релиз и pull request'ы»): шаги стека NNN-prK
+# вливаются в ветку stack/NNN, и только её PR в main является точкой релиза
+# изменений — на нём гоняются heavy тесты. Открывать этот PR руками легко
+# забыть, а пока его нет, собранный стек не виден ни ревьюеру, ни CI.
+#
+# Этот workflow открывает его сам: как только в stack/NNN влит первый шаг,
+# появляется черновик stack/NNN → main. Дальнейшие слияния в ту же ветку
+# видят открытый PR и ничего не делают — PR просто растёт вместе со стеком.
+#
+# Почему ЧЕРНОВИК. PR, созданный под GITHUB_TOKEN, не порождает событий
+# workflow (исключения — workflow_dispatch и repository_dispatch), так что
+# проверки на нём при создании всё равно не запустятся. Черновик делает это
+# честным состоянием, а не сюрпризом: heavy на черновиках выключены (job
+# decide в ci.yml), и весь набор проверок, включая heavy, стартует один раз —
+# когда человек снимает черновик кнопкой «Ready for review» (тип события
+# ready_for_review в ci.yml). Это ровно тот момент, когда стек готов к
+# слиянию, ради которого heavy и разводились с unit.
+#
+# Пару этому workflow составляет stack-branch.yml: он создаёт саму ветку
+# stack/NNN и переводит на неё базу PR шага.
+
+on:
+  pull_request:
+    types: [closed]
+
+# Один авто-PR на ветку стека: если два шага стека слиты почти одновременно,
+# вторая проверка «PR уже открыт?» должна увидеть результат первой, а не
+# гнаться с ней за создание дубля. Группа — по ветке стека, а не по PR.
+concurrency:
+  group: stack-auto-pr-${{ github.base_ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-stack-pr:
+    name: Open stack PR to main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Только слитый (не просто закрытый) PR в ветку стека и только из ветки
+    # этого же репозитория: у PR из форка GITHUB_TOKEN read-only независимо
+    # от permissions выше — создать PR он не сможет, молча пропускаем.
+    if: >-
+      github.event.pull_request.merged == true
+      && startsWith(github.base_ref, 'stack/')
+      && github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Ensure stack PR to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MERGED_PR: ${{ github.event.pull_request.number }}
+          STACK_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          stack_id="$(printf '%s' "$STACK_BRANCH" | sed -nE 's|^stack/([0-9]+)$|\1|p')"
+          if [ -z "$stack_id" ]; then
+            echo "База '$STACK_BRANCH' не ветка стека (stack/NNN) — авто-PR не нужен."
+            exit 0
+          fi
+
+          existing="$(gh pr list --repo "$REPO" --base main --head "$STACK_BRANCH" \
+            --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing" ]; then
+            echo "PR стека уже открыт: $existing — ничего не делаем."
+            exit 0
+          fi
+
+          # Стек мог быть уже влит в main, а ветка стека — остаться. Тогда PR
+          # был бы пустым, и GitHub отказал бы с 422; не доводим до ошибки.
+          ahead="$(gh api "repos/$REPO/compare/main...$STACK_BRANCH" --jq .ahead_by)"
+          if [ "$ahead" -eq 0 ]; then
+            echo "Ветка $STACK_BRANCH не опережает main — открывать нечего."
+            exit 0
+          fi
+
+          # Заголовок задачи NNN — чтобы PR стека читался списком, а не номером.
+          # Задачи может не быть (ветка стека заведена под внешний номер) —
+          # тогда обходимся номером.
+          issue_title="$(gh issue view "$stack_id" --repo "$REPO" --json title --jq .title 2>/dev/null || true)"
+          if [ -n "$issue_title" ]; then
+            title="Стек #${stack_id}: ${issue_title}"
+          else
+            title="Стек #${stack_id}"
+          fi
+
+          {
+            printf 'Интеграционный PR стека `%s` → `main`. Открыт автоматически\n' "$STACK_BRANCH"
+            printf 'после слияния #%s — дальнейшие шаги стека доедут в него сами.\n\n' "$MERGED_PR"
+            printf 'Пока это **черновик**, гоняются только линтеры и юнит-тесты.\n'
+            printf 'Heavy тесты (testcontainers, живые gRPC/HTTP серверы) запустятся,\n'
+            printf 'когда стек будет собран и кто-нибудь снимет черновик кнопкой\n'
+            printf '«Ready for review» — один раз на весь стек, как и задумано.\n\n'
+            printf 'Задача: #%s\n\n' "$stack_id"
+            printf 'Описание перед слиянием стоит дописать руками: что стек делает целиком\n'
+            printf 'и закрывает ли он задачу (`Closes #%s` — закрывающее слово намеренно\n' "$stack_id"
+            printf 'не проставлено автоматикой).\n\n'
+            printf -- '---\n\n'
+            printf 'Подробности — раздел «Релиз и pull request'"'"'ы» в `CLAUDE.md`.\n'
+          } > /tmp/stack-pr-body.md
+
+          # --head здесь обязателен: он же отключает попытки gh запушить ветку
+          # или форкнуть репозиторий, которых в CI без чекаута быть не может.
+          pr_url="$(gh pr create --repo "$REPO" \
+            --base main --head "$STACK_BRANCH" --draft \
+            --title "$title" --body-file /tmp/stack-pr-body.md)"
+          echo "Открыт черновик PR стека: $pr_url"
+
+          {
+            printf 'Стек собирается: открыт черновик интеграционного PR **%s**.\n\n' "$pr_url"
+            printf 'Следующие шаги стека вливаются в `%s` и доедут в него сами.\n' "$STACK_BRANCH"
+            printf 'Когда стек будет готов — снять черновик, это запустит heavy тесты.\n\n'
+            printf -- '---\n'
+          } > /tmp/stack-pr-comment.md
+
+          gh pr comment "$MERGED_PR" --repo "$REPO" --body-file /tmp/stack-pr-comment.md
